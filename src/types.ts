@@ -1,3 +1,6 @@
+export type ExtraType = 'none' | 'wide' | 'no_ball' | 'bye' | 'leg_bye';
+export type WicketType = 'none' | 'bowled' | 'caught' | 'lbw' | 'stumped' | 'run_out' | 'retired_hurt' | 'retired_out';
+
 export interface Player {
   id: string;
   name: string;
@@ -6,124 +9,135 @@ export interface Player {
   ballsFaced: number;
   fours: number;
   sixes: number;
-  oversBowled: number; // in fractional notation or balls
+  oversBowled: number;
   ballsBowled: number;
   runsConceded: number;
   wicketsTaken: number;
   isOut: boolean;
-  battingStatus?: 'not_batting' | 'active' | 'out' | 'retired_hurt' | 'retired_out';
+  battingStatus?: 'active' | 'not_batting' | 'out' | 'retired_hurt' | 'retired_out';
   dismissalInfo?: string;
-  contextualImpactScore?: number; // CIS out of 10
+  contextualImpactScore?: number;
+  photoUrl?: string;
 }
 
-export type ExtraType = 'none' | 'wide' | 'no_ball' | 'bye' | 'leg_bye';
-
-export type WicketType = 'none' | 'bowled' | 'caught' | 'lbw' | 'run_out' | 'stumped' | 'hit_wicket' | 'retired_hurt' | 'retired_out';
-
-export interface BallEvent {
-  id: string;
-  overNum: number; // 0-indexed
-  ballNum: number; // 1-indexed for legal balls (1-6)
-  strikerId: string;
-  strikerName: string;
-  nonStrikerId: string;
-  bowlerId: string;
-  bowlerName: string;
-  runsScored: number; // off bat (0, 1, 2, 3, 4, 6)
-  extraType: ExtraType;
-  extraRuns: number; // runs from extra
-  isLegalDelivery: boolean;
-  wicketEvent?: {
-    type: WicketType;
-    dismissedPlayerId: string;
-    dismissedPlayerName: string;
-    fielderName?: string;
-  };
-  totalRunsEvent: number; // total runs from this ball (bat + extra)
-  wagonWheelX?: number; // percentage 0-100
-  wagonWheelY?: number; // percentage 0-100
+export interface Team {
+  id: 'team_a' | 'team_b';
+  name: string;
+  players: Player[];
+  flagUrl?: string;
 }
 
 export interface Partnership {
   runs: number;
   balls: number;
-  batsmenIds: [string, string];
+  batsmenIds: string[];
+}
+
+export interface BallEvent {
+  id: string;
+  overNum: number;
+  ballNum: number;
+  strikerId: string;
+  strikerName: string;
+  nonStrikerId: string;
+  bowlerId: string;
+  bowlerName: string;
+  runsScored: number;
+  extraType: ExtraType;
+  extraRuns: number;
+  isLegalDelivery: boolean;
+  wicketEvent?: any;
+  totalRunsEvent: number;
+  wagonWheelX?: number;
+  wagonWheelY?: number;
+}
+
+export interface TournamentTeam {
+  id: string;
+  name: string;
+  captain: string;
+  coach: string;
+  flagUrl: string;
+  shortName: string;
+  points: number;
+  wins: number;
+  losses: number;
+  draws: number;
+  nrr: number;
+}
+
+export interface Fixture {
+  id: string;
+  tournament_id: string;
+  venue: string;
+  team_a_id: string;
+  team_b_id: string;
+  team_a_name: string;
+  team_b_name: string;
+  status: 'SCHEDULED' | 'LIVE' | 'COMPLETED';
+  team_a_runs?: number;
+  team_a_wickets?: number;
+  team_a_overs_faced?: number;
+  team_b_runs?: number;
+  team_b_wickets?: number;
+  team_b_overs_faced?: number;
+  winner_team_id?: string;
+  is_tied?: boolean;
+  scheduled_at?: string;
 }
 
 export interface MatchState {
   id: string;
-  teamA: {
-    id: 'team_a';
-    name: string;
-    players: Player[];
-    flagUrl: string;
-  };
-  teamB: {
-    id: 'team_b';
-    name: string;
-    players: Player[];
-    flagUrl: string;
-  };
-  tossWinner: 'team_a' | 'team_b';
-  tossDecidedTo: 'bat' | 'bowl';
-  matchStatus: 'scheduled' | 'live' | 'innings_break' | 'completed' | 'abandoned';
-  currentInnings: 1 | 2;
+  teamA: Team;
+  teamB: Team;
+  tossWinner?: string;
+  tossDecidedTo?: string;
+  matchStatus: 'live' | 'innings_break' | 'completed' | 'setup';
+  currentInnings: number;
   battingTeamId: 'team_a' | 'team_b';
   bowlingTeamId: 'team_a' | 'team_b';
   maxOvers: number;
-  target?: number; // Init only during 2nd innings
   runs: number;
   wickets: number;
-  legalBalls: number; // total legal deliveries bowled so far in current innings
-  strikerId: string; // active batter
-  nonStrikerId: string; // secondary batter
-  activeBowlerId: string; // active bowler
+  legalBalls: number;
+  strikerId: string;
+  nonStrikerId: string;
+  activeBowlerId: string;
   currentPartnership: Partnership;
-  historicalPartnerships: {
-    runs: number;
-    balls: number;
-    batter1Name: string;
-    batter2Name: string;
-  }[];
-  fallOfWickets: {
-    wicketNum: number;
-    runs: number;
-    oversCount: string;
-    batsmanName: string;
-  }[];
-  ballHistory: BallEvent[]; // All balls in CURRENT innings
-  innings1Total?: {
-    runs: number;
-    wickets: number;
-    oversStr: string;
-  };
+  historicalPartnerships: Array<{ runs: number; balls: number; batter1Name: string; batter2Name: string }>;
+  fallOfWickets: Array<any>;
+  ballHistory: BallEvent[];
   venue: string;
-  commentaryState?: string; // AI commentator advice
-  
-  // Real-time broadcast overlay triggers
+  commentaryState: string;
+  customTextPlate: string;
+  target?: number;
+  innings1Total?: { runs: number; wickets: number; oversStr: string };
+  resultText?: string;
   showTargetOverlay?: boolean;
   showBattingCardOverlay?: boolean;
   showBowlingCardOverlay?: boolean;
   showDismissedPlayerOverlay?: boolean;
-  lastDismissedPlayer?: {
-    name: string;
-    runsScored: number;
-    ballsFaced: number;
-    fours: number;
-    sixes: number;
-    dismissalInfo: string;
-    teamName: string;
-  };
-  activeFullScreenPlate?: 'none' | 'vs-splash' | 'playing-xi' | 'batting-card' | 'bowling-card' | 'match-summary';
+  lastDismissedPlayer?: any;
+  activeFullScreenPlate?: string;
+  isSuperOver?: boolean;
+  penaltyRuns?: number;
+  dlsTarget?: number;
+  tournamentId?: string;
+  fixtureId?: string;
   activeLayout?: string;
   activeAccent?: string;
   activeFont?: string;
-  // Phase 2 features extensions
-  dlsTarget?: number;
-  isSuperOver?: boolean;
-  sponsorLogoUrl?: string;
-  penaltyRuns?: number;
-  showManhattanOverlay?: boolean;
-  showPlayingXISplash?: boolean;
-  showDrinksSummarySplash?: boolean;
+  activeBranding?: string;
+  activeTournamentName?: string;
+  [key: string]: any;
+}
+
+export interface Tournament {
+  id: string;
+  name: string;
+  format: string;
+  status: string;
+  config_num_groups: number;
+  config_matches_per_team: number;
+  created_at: string;
 }

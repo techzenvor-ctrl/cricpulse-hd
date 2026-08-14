@@ -5,7 +5,8 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
-import { MatchState, Player, BallEvent, ExtraType, WicketType } from './src/types';
+import { MatchState, Player, BallEvent, ExtraType, WicketType } from './types';
+import { tournamentRouter, tournamentTeams, fixtures, playerStats, syncCompletedMatchToTournament, saveDatabase, saveDatabaseToSupabase, setSupabaseClient, handleDeleteTeam, handleUpdateTeam } from './tournamentApi';
 
 // Load env.local if present, else standard env
 if (fs.existsSync(path.resolve(process.cwd(), '.env.local'))) {
@@ -21,14 +22,44 @@ if (!supabaseUrl || !supabaseKey) {
   console.warn("WARNING: SUPABASE_URL or SUPABASE_KEY is missing. Database persistence is disabled.");
 }
 
-const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
+let supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
+if (supabase) {
+  setSupabaseClient(supabase);
+}
 
 
 // Initialize full in-memory state representing the current match
-// Match History Archive array
+// Match History Archive array with disk persistence
 const pastMatchesHistory: MatchState[] = [];
+const HISTORY_FILE = path.join(process.cwd(), 'match_history_db.json');
 
-// Start Express server prepopulated with the famous India vs Australia live from Mumbai match as shown in mock screens
+function loadHistory() {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      const raw = fs.readFileSync(HISTORY_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        pastMatchesHistory.length = 0;
+        pastMatchesHistory.push(...parsed);
+        console.log(`[HISTORY DATABASE LOADED] Loaded ${pastMatchesHistory.length} completed matches from disk.`);
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load match history:', err);
+  }
+}
+
+function saveHistory() {
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(pastMatchesHistory, null, 2), 'utf-8');
+    console.log('[HISTORY DATABASE SAVED] Match history persistently saved to disk.');
+  } catch (err) {
+    console.error('Failed to save match history:', err);
+  }
+}
+
+// Load history immediately on load
+loadHistory();
 const DEFAULT_PLAYERS_A: Player[] = [
   { id: 'ind_1', name: 'V. Kohli', teamId: 'team_a', runsScored: 82, ballsFaced: 54, fours: 8, sixes: 3, oversBowled: 0, ballsBowled: 0, runsConceded: 0, wicketsTaken: 0, isOut: false, contextualImpactScore: 9.4 },
   { id: 'ind_2', name: 'R. Sharma', teamId: 'team_a', runsScored: 104, ballsFaced: 92, fours: 12, sixes: 4, oversBowled: 0, ballsBowled: 0, runsConceded: 0, wicketsTaken: 0, isOut: false, contextualImpactScore: 9.0 },
@@ -122,8 +153,14 @@ const DEFAULT_MATCH_STATE: MatchState = {
     wickets: 7,
     oversStr: '50.0'
   },
-  venue: 'Wankhede Stadium, Mumbai',
-  commentaryState: 'India needs 51 runs off 104 balls style with V. Kohli and R. Sharma building a flawless 94-run partnership.'
+  venue: 'Cricket Stadium',
+  commentaryState: 'India needs 51 runs off 104 balls style with V. Kohli and R. Sharma building a flawless 94-run partnership.',
+  activeLayout: 'sky-sports',
+  activeAccent: '#10b981',
+  activeFont: 'Space Grotesk',
+  activeFullScreenPlate: 'none',
+  activeBranding: 'CRICPULSE',
+  activeTournamentName: 'ICC CHAMPIONS TROPHY'
 };
 
 let matchState: MatchState = JSON.parse(JSON.stringify(DEFAULT_MATCH_STATE));
@@ -145,6 +182,10 @@ async function initMatchState() {
 
     if (error && error.code !== 'PGRST116') { // row not found is code PGRST116
       console.error("Error fetching match state from Supabase:", error.message);
+      if (error.message && (error.message.includes("Invalid API key") || error.message.includes("apiKey") || error.message.includes("API key"))) {
+        console.warn("Invalid API key detected. Disabling Supabase integration and switching to fully in-memory local operations.");
+        supabase = null;
+      }
       return;
     }
 
@@ -157,7 +198,7 @@ async function initMatchState() {
       const { error: insertError } = await supabase
         .from('matches')
         .insert({ id: MATCH_ID, state: DEFAULT_MATCH_STATE });
-      
+
       if (insertError) {
         console.error("Error creating default match state in Supabase:", insertError.message);
       } else {
@@ -183,6 +224,10 @@ async function saveMatchState() {
 
     if (error) {
       console.error("Error saving match state to Supabase:", error.message);
+      if (error.message && (error.message.includes("Invalid API key") || error.message.includes("apiKey") || error.message.includes("API key"))) {
+        console.warn("Invalid API key detected. Disabling Supabase integration and switching to fully in-memory local operations.");
+        supabase = null;
+      }
     }
   } catch (err: any) {
     console.error("Unexpected error saving match state to Supabase:", err.message || err);
@@ -285,9 +330,11 @@ function updateALLCIS() {
 }
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3001;
+const PORT = Number(process.env.PORT) || 3005;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use('/api/tournament', tournamentRouter);
 
 // API routes FIRST
 app.get('/api/match-state', (req, res) => {
@@ -338,6 +385,14 @@ app.post('/api/match-state/ball', async (req, res) => {
 
   if (!striker || !nonStriker || !activeBowler) {
     return res.status(400).json({ error: 'At least one of striker, non-striker or bowler is missing' });
+  }
+
+  // Enforce no consecutive overs for same bowler
+  if (matchState.legalBalls > 0 && matchState.legalBalls % 6 === 0) {
+    const lastLegalBall = [...matchState.ballHistory].reverse().find(b => b.isLegalDelivery);
+    if (lastLegalBall && lastLegalBall.bowlerId === activeBowlerId) {
+      return res.status(400).json({ error: 'A bowler cannot bowl consecutive overs. Please select a different bowler.' });
+    }
   }
 
   const isLegalDelivery = extraType === 'none' || extraType === 'bye' || extraType === 'leg_bye';
@@ -464,16 +519,11 @@ app.post('/api/match-state/ball', async (req, res) => {
       };
       matchState.showDismissedPlayerOverlay = true;
 
-      // Set new incoming batsman automatically if available
-      const nextBatter = battingTeam.players.find(p => p.battingStatus === 'not_batting' && p.id !== strikerId && p.id !== nonStrikerId && p.runsScored === 0 && p.ballsFaced === 0);
-      if (nextBatter) {
-        if (dismissedId === strikerId) {
-          matchState.strikerId = nextBatter.id;
-        } else {
-          matchState.nonStrikerId = nextBatter.id;
-        }
-        nextBatter.battingStatus = 'active';
-        matchState.currentPartnership.batsmenIds = [matchState.strikerId, matchState.nonStrikerId];
+      // Clear slot of dismissed batsman, forcing manual selection
+      if (dismissedId === strikerId) {
+        matchState.strikerId = "";
+      } else {
+        matchState.nonStrikerId = "";
       }
     }
   }
@@ -569,9 +619,11 @@ app.post('/api/match-state/ball', async (req, res) => {
       matchState.ballHistory = [];
     } else {
       matchState.matchStatus = 'completed';
+      syncCompletedMatchToTournament(matchState);
     }
   } else if (matchState.currentInnings === 2 && matchState.target && matchState.runs >= matchState.target) {
     matchState.matchStatus = 'completed';
+    syncCompletedMatchToTournament(matchState);
   }
 
   // Calculate live CIS impact rankings
@@ -680,10 +732,10 @@ app.post('/api/match-state/add-bowler', async (req, res) => {
 
   const cleanName = name.trim();
   const bowlingTeam = matchState.bowlingTeamId === 'team_a' ? matchState.teamA : matchState.teamB;
-  
+
   // Check if player with the same name already exists in the bowling team
   let existingPlayer = bowlingTeam.players.find(p => p.name.toLowerCase() === cleanName.toLowerCase());
-  
+
   if (!existingPlayer) {
     const newId = `bowler_${Date.now()}`;
     const newPlayer: Player = {
@@ -720,10 +772,10 @@ app.post('/api/match-state/add-batter', async (req, res) => {
 
   const cleanName = name.trim();
   const battingTeam = matchState.battingTeamId === 'team_a' ? matchState.teamA : matchState.teamB;
-  
+
   // Check if player with the same name already exists in the batting team
   let existingPlayer = battingTeam.players.find(p => p.name.toLowerCase() === cleanName.toLowerCase());
-  
+
   if (!existingPlayer) {
     const newId = `batter_${Date.now()}`;
     const newPlayer: Player = {
@@ -758,16 +810,25 @@ app.post('/api/match-state/add-batter', async (req, res) => {
 
 // Manual settings swap override (e.g. swap batter positions, change active bowlers manually)
 app.post('/api/match-state/override', async (req, res) => {
-  const { 
-    strikerId, nonStrikerId, activeBowlerId, battingTeamId, bowlingTeamId, 
+  const {
+    strikerId, nonStrikerId, activeBowlerId, battingTeamId, bowlingTeamId,
     matchStatus, venue, currentInnings, target,
     showTargetOverlay, showBattingCardOverlay, showBowlingCardOverlay, showDismissedPlayerOverlay,
     lastDismissedPlayer, activeFullScreenPlate,
-    activeLayout, activeAccent, activeFont
+    activeLayout, activeAccent, activeFont, activeBranding, activeTournamentName, customTextPlate, sponsorLogoUrl
   } = req.body;
 
-  if (strikerId) matchState.strikerId = strikerId;
-  if (nonStrikerId) matchState.nonStrikerId = nonStrikerId;
+  const battingTeam = matchState.battingTeamId === 'team_a' ? matchState.teamA : matchState.teamB;
+  if (strikerId) {
+    matchState.strikerId = strikerId;
+    const player = battingTeam.players.find(p => p.id === strikerId);
+    if (player) player.battingStatus = 'active';
+  }
+  if (nonStrikerId) {
+    matchState.nonStrikerId = nonStrikerId;
+    const player = battingTeam.players.find(p => p.id === nonStrikerId);
+    if (player) player.battingStatus = 'active';
+  }
   if (activeBowlerId) matchState.activeBowlerId = activeBowlerId;
   if (battingTeamId) matchState.battingTeamId = battingTeamId;
   if (bowlingTeamId) matchState.bowlingTeamId = bowlingTeamId;
@@ -782,28 +843,36 @@ app.post('/api/match-state/override', async (req, res) => {
   if (showDismissedPlayerOverlay !== undefined) matchState.showDismissedPlayerOverlay = showDismissedPlayerOverlay;
   if (lastDismissedPlayer !== undefined) matchState.lastDismissedPlayer = lastDismissedPlayer;
   if (activeFullScreenPlate !== undefined) matchState.activeFullScreenPlate = activeFullScreenPlate;
-  
+
   if (activeLayout !== undefined) matchState.activeLayout = activeLayout;
   if (activeAccent !== undefined) matchState.activeAccent = activeAccent;
   if (activeFont !== undefined) matchState.activeFont = activeFont;
+  if (activeBranding !== undefined) matchState.activeBranding = activeBranding;
+  if (activeTournamentName !== undefined) matchState.activeTournamentName = activeTournamentName;
+  if (customTextPlate !== undefined) matchState.customTextPlate = customTextPlate;
+  if (sponsorLogoUrl !== undefined) matchState.sponsorLogoUrl = sponsorLogoUrl;
 
   updateALLCIS();
+  notifyClients();
   await saveMatchState();
   res.json(matchState);
 });
 
 // Reset match configuration completely
 app.post('/api/match-state/reset', async (req, res) => {
-  const { teamAName, teamBName, maxOvers, tossWinner, tossDecidedTo, inningsType, teamAPlayers, teamBPlayers, strikerName, nonStrikerName, bowlerName } = req.body;
+  const { teamAName, teamBName, teamALogo, teamBLogo, maxOvers, tossWinner, tossDecidedTo, inningsType, teamAPlayers, teamBPlayers, strikerName, nonStrikerName, bowlerName, venue } = req.body;
 
   // Re-verify base values
   matchState = JSON.parse(JSON.stringify(DEFAULT_MATCH_STATE));
 
   if (teamAName) matchState.teamA.name = teamAName.toUpperCase();
   if (teamBName) matchState.teamB.name = teamBName.toUpperCase();
+  if (teamALogo) matchState.teamA.flagUrl = teamALogo;
+  if (teamBLogo) matchState.teamB.flagUrl = teamBLogo;
   if (maxOvers) matchState.maxOvers = maxOvers;
   if (tossWinner) matchState.tossWinner = tossWinner;
   if (tossDecidedTo) matchState.tossDecidedTo = tossDecidedTo;
+  if (venue) matchState.venue = venue;
 
   if (teamAPlayers && Array.isArray(teamAPlayers)) {
     matchState.teamA.players = teamAPlayers.map((name, index) => {
@@ -924,7 +993,7 @@ app.post('/api/match-state/reset', async (req, res) => {
 
   matchState.strikerId = selectedStriker ? selectedStriker.id : (batTeam.players[0] ? batTeam.players[0].id : '');
   matchState.nonStrikerId = selectedNonStriker ? selectedNonStriker.id : (batTeam.players[1] ? batTeam.players[1].id : '');
-  
+
   const strikerPlayer = batTeam.players.find(p => p.id === matchState.strikerId);
   const nonStrikerPlayer = batTeam.players.find(p => p.id === matchState.nonStrikerId);
   if (strikerPlayer) strikerPlayer.battingStatus = 'active';
@@ -975,7 +1044,7 @@ app.post('/api/match-state/super-over', async (req, res) => {
 
   matchState.strikerId = batTeam.players[0] ? batTeam.players[0].id : '';
   matchState.nonStrikerId = batTeam.players[1] ? batTeam.players[1].id : '';
-  
+
   if (batTeam.players[0]) batTeam.players[0].battingStatus = 'active';
   if (batTeam.players[1]) batTeam.players[1].battingStatus = 'active';
 
@@ -997,7 +1066,7 @@ app.post('/api/match-state/super-over', async (req, res) => {
 app.post('/api/match-state/penalty', async (req, res) => {
   matchState.runs += 5;
   matchState.penaltyRuns = (matchState.penaltyRuns || 0) + 5;
-  
+
   await saveMatchState();
   res.json(matchState);
 });
@@ -1005,56 +1074,66 @@ app.post('/api/match-state/penalty', async (req, res) => {
 // AI commentaries with Gemini API (Proxying requests securely server-side)
 app.post('/api/ai-insights', async (req, res) => {
   try {
-    const aiKey = process.env.GEMINI_API_KEY;
-    if (!aiKey) {
-      return res.json({
-        commentary: "Config the GEMINI_API_KEY in Settings to enable real-time professional AI match prognosis, momentum tracking, and stadium scoreboard commentaries."
-      });
-    }
-
-    const ai = new GoogleGenAI({
-      apiKey: aiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
-
     const battingTeam = matchState.battingTeamId === 'team_a' ? matchState.teamA : matchState.teamB;
     const bowlingTeam = matchState.bowlingTeamId === 'team_a' ? matchState.teamA : matchState.teamB;
     const strikerObj = battingTeam.players.find(p => p.id === matchState.strikerId);
     const bowlerObj = bowlingTeam.players.find(p => p.id === matchState.activeBowlerId);
 
-    const matchContext = `
-      Match venue: ${matchState.venue}.
-      Batting Team: ${battingTeam.name} scoring ${matchState.runs}/${matchState.wickets} off ${Math.floor(matchState.legalBalls / 6)}.${matchState.legalBalls % 6} overs.
-      Current Innings: ${matchState.currentInnings} of ${matchState.maxOvers} maximum overs.
-      Target to Chase: ${matchState.target || 'Innings 1 - set high score'}.
-      Striker Batsman: ${strikerObj?.name || 'Active Striker'} having runs ${strikerObj?.runsScored} off ${strikerObj?.ballsFaced} balls (fours: ${strikerObj?.fours}, sixes: ${strikerObj?.sixes}).
-      Bowler: ${bowlerObj?.name || 'Active Bowler'} conceding ${bowlerObj?.runsConceded} runs with ${bowlerObj?.wicketsTaken} wickets off ${bowlerObj?.oversBowled} overs.
-      Current run rate is ${(matchState.runs / Math.max(matchState.legalBalls / 6, 0.1)).toFixed(2)}.
-    `;
+    const oversStr = `${Math.floor(matchState.legalBalls / 6)}.${matchState.legalBalls % 6}`;
+    let commentaryText = "";
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: `You are CricPulse's intelligent elite sports broadcaster. Generate a sharp, highly technical, and engaging 1-2 sentence real-time tactical commentary or predictive prediction for the physical live stadium LEDs based on current play contextual data: ${matchContext}. Make it sound energetic, professional, live, and do not use generic fluff.`,
-    });
+    if (matchState.matchStatus === 'completed') {
+      commentaryText = `Match completed! ${battingTeam.name} finished at ${matchState.runs}/${matchState.wickets} in ${oversStr} overs.`;
+      if (matchState.target) {
+        if (matchState.runs >= matchState.target) {
+          commentaryText += ` A historic chase! ${battingTeam.name} wins by ${10 - matchState.wickets} wickets!`;
+        } else {
+          commentaryText += ` Brilliant bowling! ${bowlingTeam.name} wins by ${matchState.target - 1 - matchState.runs} runs!`;
+        }
+      }
+    } else if (matchState.matchStatus === 'innings_break') {
+      commentaryText = `Innings break! ${bowlingTeam.name} finished their innings at ${matchState.innings1Total?.runs}/${matchState.innings1Total?.wickets}. ${battingTeam.name} needs ${matchState.target} runs to win.`;
+    } else {
+      // Dynamic game commentary
+      const lastBall = matchState.ballHistory[matchState.ballHistory.length - 1];
+      if (lastBall) {
+        if (lastBall.wicketEvent) {
+          commentaryText = `WICKET! ${lastBall.wicketEvent.dismissedPlayerName || strikerObj?.name} is OUT (${lastBall.wicketEvent.type || 'dismissed'}). Huge breakthrough for ${bowlerObj?.name}! `;
+        } else if (lastBall.runsScored === 6) {
+          commentaryText = `SIX! Magnificent shot by ${lastBall.strikerName || strikerObj?.name}! Dispatched high and handsome over the boundary. `;
+        } else if (lastBall.runsScored === 4) {
+          commentaryText = `FOUR! Superb timing by ${lastBall.strikerName || strikerObj?.name}, finding the gap cleanly to the fence. `;
+        } else if (lastBall.totalRunsEvent === 0) {
+          commentaryText = `Dot ball. Excellent line and length from ${bowlerObj?.name || 'the bowler'}. `;
+        } else {
+          commentaryText = `${lastBall.strikerName || strikerObj?.name} picks up ${lastBall.totalRunsEvent} run${lastBall.totalRunsEvent > 1 ? 's' : ''}. `;
+        }
+      }
 
-    const text = response.text || "Perfect tactical overview ready.";
-    matchState.commentaryState = text;
+      // Add chase/target context
+      if (matchState.currentInnings === 2 && matchState.target) {
+        const runsNeeded = matchState.target - matchState.runs;
+        const ballsRemaining = Math.max(0, matchState.maxOvers * 6 - matchState.legalBalls);
+        commentaryText += `${battingTeam.name} needs ${runsNeeded} runs in ${ballsRemaining} balls. Required run rate: ${((runsNeeded / Math.max(ballsRemaining / 6, 0.1))).toFixed(2)} RPO.`;
+      } else {
+        commentaryText += `${battingTeam.name} is currently ${matchState.runs}/${matchState.wickets} after ${oversStr} overs. Current Run Rate: ${(matchState.runs / Math.max(matchState.legalBalls / 6, 0.1)).toFixed(2)} RPO.`;
+      }
+    }
+
+    matchState.commentaryState = commentaryText;
     await saveMatchState();
 
-    res.json({ commentary: text });
+    res.json({ commentary: commentaryText });
   } catch (error: any) {
-    console.error("Gemini API error:", error);
-    res.status(500).json({ error: error.message || 'Error querying Gemini API' });
+    console.error("Commentary generation error:", error);
+    res.status(500).json({ error: error.message || 'Error generating local commentary' });
   }
 });
 // Match History Endpoints
 app.post('/api/match-state/archive', (req, res) => {
   // Save a deep copy to history
   pastMatchesHistory.push(JSON.parse(JSON.stringify(matchState)));
+  saveHistory();
   notifyClients();
   res.json({ success: true, count: pastMatchesHistory.length });
 });
@@ -1066,18 +1145,21 @@ app.get('/api/match-history', (req, res) => {
 // Setup development server middleware vs production static hosting
 async function startServer() {
   await initMatchState();
-  if (process.env.NODE_ENV !== 'production') {
+  if (supabase) {
+    saveDatabaseToSupabase(supabase);
+  }
+
+  const isProd = process.env.NODE_ENV === 'production';
+
+  if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.use(express.static('dist'));
+    app.use('*', (req, res) => res.sendFile(path.resolve('dist/index.html')));
   }
 
   app.listen(PORT, '0.0.0.0', () => {
